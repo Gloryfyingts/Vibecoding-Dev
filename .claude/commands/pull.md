@@ -85,24 +85,18 @@ Run:
 cd "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Dev" && git checkout <ORIGINAL_BRANCH>
 ```
 
-## Step 6: Remove all tracked files from Dev working tree
+## Step 6: Remove all files from Dev working tree except .git/
 
-Remove every file that is tracked in the current branch, leaving only `.git/`. Run:
+Remove every file and directory in the Dev working tree, leaving only `.git/`. Run:
 ```bash
-cd "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Dev" && git ls-files | xargs rm -f
+find "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Dev" -maxdepth 1 -mindepth 1 -not -name '.git' -exec rm -rf {} +
 ```
 
 ## Step 7: Copy all files from Vibecoding-Original into Dev repo
 
 Copy every file and directory from `$MAIN_REPO` into `$DEV_REPO`, excluding `.git/`. Run:
 ```bash
-cp -r "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Original/." "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Dev/" && rm -rf "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Dev/.git"
-```
-
-Note: The `.git` directory of Dev repo was restored by the last command but we must NOT have deleted the Dev repo's `.git`. Use this safer approach instead:
-
-```bash
-find "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Original" -maxdepth 1 -not -name '.git' -not -name '.' | while read src; do
+find "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Original" -maxdepth 1 -mindepth 1 -not -name '.git' | while read src; do
   filename=$(basename "$src")
   cp -r "$src" "/c/Users/Wildberries(Work)/Desktop/VBGuide/Vibecoding-Dev/$filename"
 done
