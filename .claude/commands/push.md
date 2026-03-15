@@ -81,7 +81,7 @@ and stop.
 
 ## Step 5: Check for uncommitted changes in Original repo
 
-Read the file `$MAIN_REPO/.git/index` status by listing the working tree. Since you cannot run git in Original repo, instead warn the user:
+Since you cannot run git in Original repo, warn the user:
 
 Print:
 ```
