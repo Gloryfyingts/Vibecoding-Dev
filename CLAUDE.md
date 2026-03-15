@@ -6,6 +6,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Data engineering project building pipelines with Apache Flink, Apache Iceberg, S3 storage, and open API data ingestion. Rust/Go may be introduced later. The repo includes AI agent definitions for Claude Code to orchestrate development.
 
+## Two-Repo Workflow
+
+This project uses two repositories:
+- **Vibecoding-Original** (`../Vibecoding-Original`) -- clean showcase repo, no AI artifacts. Remote: `https://github.com/Gloryfyingts/Vibecoding-Original.git`. Branches: `main`, `stage`. Claude must NEVER run git commands in this repo.
+- **Vibecoding-Dev** (this repo) -- development repo with AI artifacts. Branches: `AI/Master`, `AI/Stage`, `Original/Master`, `Original/Stage`.
+
+Branch mapping:
+- `Original/Master` = mirror of Vibecoding-Original `main` (no AI artifacts)
+- `Original/Stage` = mirror of Vibecoding-Original `stage` (no AI artifacts)
+- `AI/Master` = development branch for main features (has AI artifacts)
+- `AI/Stage` = development branch for stage features (has AI artifacts)
+
+Git pipeline:
+1. User runs `git pull` in Vibecoding-Original
+2. `/pull <branch>` copies files into `Original/<branch>`, then merges into `AI/<branch>`
+3. Development happens on `AI/<branch>`
+4. `/push <branch>` merges `AI/<branch>` into `Original/<branch>`, then copies to Vibecoding-Original
+5. User manually commits and pushes in Vibecoding-Original
+
+AI artifacts exclusion list (never copied to Original): `.claude/`, `CLAUDE.md`, `task_plan.md`, `errors.md`, `INFRA.md`, `prompt.md`, `REPORT.MD`
+
 ## Agent Workflow
 
 This repo uses four custom Claude Code agents (`.claude/agents/`) that enforce a strict development loop:
