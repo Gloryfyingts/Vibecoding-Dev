@@ -1,0 +1,31 @@
+<clickhouse>
+    <remote_servers>
+        <cluster_2s1r>
+            <shard>
+                <replica>
+                    <host>clickhouse-shard1</host>
+                    <port>9000</port>
+                    <user from_env="CLICKHOUSE_USER"/>
+                    <password from_env="CLICKHOUSE_PASSWORD"/>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>clickhouse-shard2</host>
+                    <port>9000</port>
+                    <user from_env="CLICKHOUSE_USER"/>
+                    <password from_env="CLICKHOUSE_PASSWORD"/>
+                </replica>
+            </shard>
+        </cluster_2s1r>
+    </remote_servers>
+    <zookeeper>
+        <node>
+            <host>clickhouse-keeper</host>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+    </distributed_ddl>
+</clickhouse>

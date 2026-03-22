@@ -1,0 +1,111 @@
+services:
+  clickhouse-keeper:
+    image: clickhouse/clickhouse-keeper:24.8.7.41
+    container_name: clickhouse-keeper
+    volumes:
+      - ./config/clickhouse-keeper.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+      - clickhouse-keeper-data:/var/lib/clickhouse-keeper
+    networks:
+      - clickhouse-cluster
+    ports:
+      - "19181:9181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 1 127.0.0.1 9181 | grep -q imok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  clickhouse-shard1:
+    image: clickhouse/clickhouse-server:24.8.7.41
+    container_name: clickhouse-shard1
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: ${CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT}
+    volumes:
+      - ./config/clickhouse-common.xml:/etc/clickhouse-server/config.d/clickhouse-common.xml:ro
+      - ./config/macros-shard1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./config/users.xml:/etc/clickhouse-server/config.d/users.xml:ro
+      - clickhouse-shard1-data:/var/lib/clickhouse
+    networks:
+      - clickhouse-cluster
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    depends_on:
+      clickhouse-keeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  clickhouse-shard2:
+    image: clickhouse/clickhouse-server:24.8.7.41
+    container_name: clickhouse-shard2
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: ${CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT}
+    volumes:
+      - ./config/clickhouse-common.xml:/etc/clickhouse-server/config.d/clickhouse-common.xml:ro
+      - ./config/macros-shard2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./config/users.xml:/etc/clickhouse-server/config.d/users.xml:ro
+      - clickhouse-shard2-data:/var/lib/clickhouse
+    networks:
+      - clickhouse-cluster
+    ports:
+      - "18124:8123"
+      - "19001:9000"
+    depends_on:
+      clickhouse-keeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:24.8.7.41
+    container_name: clickhouse-init
+    volumes:
+      - ./init/init.sql:/init.sql:ro
+      - ./init/init.sh:/init.sh:ro
+    networks:
+      - clickhouse-cluster
+    depends_on:
+      clickhouse-shard1:
+        condition: service_healthy
+      clickhouse-shard2:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    entrypoint: ["bash", "/init.sh"]
+    restart: "no"
+
+networks:
+  clickhouse-cluster:
+    driver: bridge
+
+volumes:
+  clickhouse-keeper-data:
+  clickhouse-shard1-data:
+  clickhouse-shard2-data:

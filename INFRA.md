@@ -2,11 +2,81 @@
 
 ## Date
 
-2026-03-21
+2026-03-22 (ClickHouse stand added)
 
-## Task Completed
+## Tasks Completed
 
-Full local development environment implemented per `task_plan.md`. All 10 services defined in `docker-compose.yml` with healthchecks, named volumes, memory limits, and credentials from `.env`. Custom Dockerfiles for Flink and Jupyter created. Postgres init SQL, Flink SQL/PyFlink jobs, and Jupyter E2E test notebook created.
+- 2026-03-21: Full local development environment (main stack) — Postgres, MinIO, Redpanda, Flink, Spark, Jupyter
+- 2026-03-22: ClickHouse local stand — 2-shard cluster with Keeper, analytics and inventory databases, distributed tables, data skipping indexes, factorial UDF
+
+---
+
+## ClickHouse Stand
+
+Standalone 3-container cluster defined in `clickhouse/docker-compose.yml`. Fully isolated from the main stack.
+
+### Services
+
+| Service | Container Name | Host Port(s) | Image | Purpose |
+|---|---|---|---|---|
+| ClickHouse Keeper | `clickhouse-keeper` | 19181 (Keeper client) | `clickhouse/clickhouse-keeper:24.8.7.41` | ZooKeeper-compatible coordination, distributed DDL task queue |
+| ClickHouse Shard 1 | `clickhouse-shard1` | 18123 (HTTP), 19000 (TCP) | `clickhouse/clickhouse-server:24.8.7.41` | Shard 1, runs init.sql seed via init container |
+| ClickHouse Shard 2 | `clickhouse-shard2` | 18124 (HTTP), 19001 (TCP) | `clickhouse/clickhouse-server:24.8.7.41` | Shard 2, receives DDL via ON CLUSTER propagation |
+| ClickHouse Init | `clickhouse-init` | — | `clickhouse/clickhouse-server:24.8.7.41` | One-shot init container, runs init.sql after shards are healthy |
+
+### Cluster Name
+
+`cluster_2s1r` — 2 shards, 1 replica per shard.
+
+### Databases and Tables
+
+- `analytics`: `user_events_local`, `daily_aggregates_local`, `session_facts_local` (ReplicatedMergeTree) + `user_events`, `daily_aggregates`, `session_facts` (Distributed)
+- `inventory`: `products_local`, `stock_movements_local`, `warehouse_snapshots_local` (ReplicatedMergeTree) + `products`, `stock_movements`, `warehouse_snapshots` (Distributed)
+
+### User-Defined Function
+
+`factorial(n)` — available on both shards via user-defined function (UDF) defined in `clickhouse/init/init.sql`.
+
+### How to Start
+
+```bash
+cd clickhouse
+cp .env.example .env
+docker compose up -d
+```
+
+### How to Stop
+
+```bash
+cd clickhouse
+docker compose down
+```
+
+### Named Volumes
+
+| Volume | Service |
+|---|---|
+| `clickhouse-keeper-data` | clickhouse-keeper |
+| `clickhouse-shard1-data` | clickhouse-shard1 |
+| `clickhouse-shard2-data` | clickhouse-shard2 |
+
+### Files Created / Modified
+
+| File | Status | Notes |
+|---|---|---|
+| `clickhouse/docker-compose.yml` | Created | 4 services (keeper, shard1, shard2, init), healthchecks, resource limits, named volumes |
+| `clickhouse/.env.example` | Created | CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT |
+| `clickhouse/config/clickhouse-keeper.xml` | Created | Single-node Keeper, listens on 0.0.0.0:9181, raft on 9234 |
+| `clickhouse/config/clickhouse-common.xml` | Created | cluster_2s1r topology, Keeper connection, inter-shard credentials from env vars |
+| `clickhouse/config/macros-shard1.xml` | Created | cluster=cluster_2s1r, shard=1, replica=shard1 |
+| `clickhouse/config/macros-shard2.xml` | Created | cluster=cluster_2s1r, shard=2, replica=shard2 |
+| `clickhouse/config/users.xml` | Created | Network access (:::/0), default profile settings |
+| `clickhouse/init/init.sql` | Created | 2 databases, 6 ReplicatedMergeTree tables, 6 Distributed tables, 8 data skipping indexes, factorial UDF |
+| `clickhouse/init/init.sh` | Created | Waits for Keeper readiness before running init.sql, handles idempotent re-runs |
+| `.gitignore` | Modified | Added clickhouse/.env |
+| `.claude/docs/clickhouse-setup.md` | Created | Full architecture documentation |
+
+---
 
 ---
 
