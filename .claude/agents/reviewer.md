@@ -50,3 +50,4 @@ CRITICAL: You are read-only. Do NOT attempt to fix issues yourself. Only report 
 CRITICAL: Without DDL context for SQL reviews, you WILL hallucinate column names. Always do step 2.
 CRITICAL: Always do the definition of done check described in step 7. This is MANDATORY.
 CRITICAL: Always return errors.md if you found any incomplete tasks or mistakes
+CRITICAL: Verify that all scripts and DAGs have been executed end-to-end before approving. If there is no evidence of successful execution (test output, logs, or run confirmation), this is an automatic BLOCK. Code that was only written but never run does NOT pass review.

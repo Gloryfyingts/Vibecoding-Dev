@@ -51,6 +51,7 @@ The enforced sequence is: **plan → code → review**. Never skip planning. Nev
 - **Credentials in `.env` only** — never hardcode in docker-compose or code; never commit `.env`
 - **Never run `docker-compose down -v`** without explicit user approval
 - **`task_plan.md` must have a definition of done** — agents will refuse to work without it
+- **Mandatory E2E testing** — after developing ANY script or making changes to ANY DAG, it is MANDATORY to run a full end-to-end test pipeline for all affected scripts. No code is considered done until it has been executed successfully. This applies to Claude Code itself and to all agents except planner.
 
 ## Local Environment
 

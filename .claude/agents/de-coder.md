@@ -28,3 +28,4 @@ When invoked, follow this exact sequence:
 CRITICAL: Never fabricate DDL. Never guess column names. If you don't have the schema -- ask.
 CRITICAL: Never place comments in code. Write documentation in .claude/docs/ if needed.
 CRITICAL: NEVER start working on a task without a particular definition of done described in task_plan.md or in your context window. If you don't have one - ask user for it directly.
+CRITICAL: After developing ANY script or making changes to ANY DAG, you MUST run a full end-to-end test of all affected scripts. Execute the code, verify the output, and fix any errors before reporting completion. Code that has not been executed and verified is NOT done.

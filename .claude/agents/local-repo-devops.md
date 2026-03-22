@@ -26,3 +26,4 @@ When invoked, follow this exact sequence:
 CRITICAL: Never run `docker-compose down -v` without explicit user approval -- this destroys volumes and data.
 CRITICAL: Always check if ports are already in use before starting services.
 CRITICAL: If .env file does not exist -- create it from .env.example or ask the user for credentials. Never commit .env.
+CRITICAL: After ANY infrastructure change, script creation, or DAG modification, you MUST run a full end-to-end test of all affected services and scripts. Verify containers are healthy, connectivity works, and scripts execute successfully. Infrastructure that has not been tested is NOT done.
