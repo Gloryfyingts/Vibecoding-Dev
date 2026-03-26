@@ -1,0 +1,19 @@
+{
+  "name": "vibecoders",
+  "description": "Data engineering development team: planner → de-coder + local-repo-devops (parallel) → reviewer. Enforces plan-code-review sequence.",
+  "createdAt": 1774531307363,
+  "leadAgentId": "team-lead@vibecoders",
+  "leadSessionId": "7858a151-a81f-4d53-81ce-ee3fd7790ab1",
+  "members": [
+    {
+      "agentId": "team-lead@vibecoders",
+      "name": "team-lead",
+      "agentType": "team-lead",
+      "model": "claude-opus-4-6[1m]",
+      "joinedAt": 1774531307363,
+      "tmuxPaneId": "",
+      "cwd": "C:\\Users\\Wildberries(Work)\\Desktop\\VBGuide\\Vibecoding-Dev",
+      "subscriptions": []
+    }
+  ]
+}
