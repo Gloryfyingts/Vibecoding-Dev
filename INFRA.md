@@ -80,6 +80,53 @@ docker compose down
 
 ---
 
+## crypto-ingest Service (added 2026-04-10)
+
+New service added to the main `docker-compose.yml` stack for cryptocurrency market data ingestion from Binance REST API.
+
+### Service Details
+
+| Service | Container Name | Host Port(s) | Image | Purpose |
+|---|---|---|---|---|
+| crypto-ingest | `crypto-ingest` | 8085 (health, internal only) | built from `./crypto-ingest` | Polls Binance API, writes trades/orderbook/ticker to PostgreSQL `crypto` schema |
+
+### Files Modified / Created
+
+| File | Change |
+|---|---|
+| `docker/postgres/init.sql` | Added `CREATE SCHEMA IF NOT EXISTS crypto;` |
+| `docker-compose.yml` | Added `crypto-ingest` service with healthcheck, `depends_on`, `mem_limit: 256m`, `stop_grace_period: 15s`, `restart: unless-stopped` |
+| `.env.example` | Added 12 crypto-ingest environment variables with defaults |
+| `crypto-ingest/Dockerfile` | Created multi-stage build: `golang:1.22.12-alpine3.21` -> `gcr.io/distroless/static-debian12:nonroot` |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `BINANCE_BASE_URL` | `https://api.binance.com` | Binance REST API base URL (change for geo-blocking mitigation) |
+| `SYMBOLS` | `BTCUSDT,ETHUSDT,ETHBTC` | Comma-separated trading pairs |
+| `TRADE_POLL_INTERVAL` | `5s` | Trade worker polling interval |
+| `ORDERBOOK_POLL_INTERVAL` | `5s` | Order book worker polling interval |
+| `ORDERBOOK_DEPTH` | `20` | Order book levels per side |
+| `TICKER_POLL_INTERVAL` | `30s` | Ticker worker polling interval |
+| `HEALTH_PORT` | `8085` | Health endpoint listen port |
+| `LOG_LEVEL` | `info` | Structured log level |
+| `MAX_RETRIES` | `3` | Max retries per failed API call |
+| `RETRY_BASE_DELAY` | `1s` | Base delay for exponential backoff |
+| `PG_MAX_CONNS` | `12` | pgx pool maximum connections |
+| `PG_ACQUIRE_TIMEOUT` | `5s` | pgx pool connection acquisition timeout |
+
+Set `HTTP_PROXY`/`HTTPS_PROXY` in `.env` if Binance is geo-blocked on the deployment network.
+
+### Notes
+
+- `DATABASE_URL` is constructed dynamically in docker-compose from `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` — not a separate `.env` variable.
+- Healthcheck uses binary self-probe `["/crypto-ingest", "--healthcheck"]` — required because distroless image has no shell, curl, or wget.
+- `crypto` schema is also created by the Go app on startup (`CREATE SCHEMA IF NOT EXISTS`) so it works on existing Postgres volumes where `init.sql` has already run.
+- Do NOT run `docker compose up` until the de-coder agent has completed the Go source files.
+
+---
+
 ## Services
 
 | Service | Container Name | Host Port(s) | Image | Purpose |

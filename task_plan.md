@@ -1,955 +1,479 @@
-# Task: Cryptocurrency Market Data Ingestion via Binance Public API into PostgreSQL using Go Workers
+# Swarm Plan: Cryptocurrency Market Data Ingestion
 
----
+## Task: Binance Public API -> PostgreSQL via Go Workers
 
-## 1. Exchange Selection: Binance
+### Task Understanding
 
-**Why Binance:**
-- Largest cryptocurrency exchange by trading volume globally
-- Fully public REST API for market data -- no API key or authentication required for read-only market endpoints
-- WebSocket streams available for real-time data (future enhancement)
-- Supports all three required assets: BTC, ETH, USDT (as quote/base currencies)
-- Generous rate limits for public endpoints (6000 request weight per minute for IP-based limits)
-- Stable, well-documented API with versioned endpoints
-- Base URL: `https://api.binance.com`
+Build a Go-based data ingestion service that polls Binance's public REST API for cryptocurrency market data (BTC, ETH, USDT trading pairs) and stores trades, order book snapshots, and 24hr ticker data into PostgreSQL. The service runs as a Docker container alongside the existing data engineering stack. This is a greenfield Go project -- no Go code exists in the repo yet.
 
-**Trading Pairs to Ingest:**
+### Chosen Approach
 
-| Symbol       | Base  | Quote |
-|--------------|-------|-------|
-| `BTCUSDT`    | BTC   | USDT  |
-| `ETHUSDT`    | ETH   | USDT  |
-| `ETHBTC`     | ETH   | BTC   |
+**Binance REST API with polling** -- Single Go binary (`crypto-ingest`) using goroutine-per-symbol-per-data-type workers. Polling at 5-second intervals for trades and order book, 30-second intervals for ticker. Data written to PostgreSQL via `pgx/v5` with batch inserts and `ON CONFLICT DO NOTHING` deduplication for trades. Resumable ingestion via high-water mark table.
 
-These three pairs cover all required assets (BTC, ETH, USDT) and their primary trading relationships.
+**Why this won (unanimous across 12 agents, 3 independent teams):**
+- Binance is the largest exchange by volume, truly public API for market data, no auth required, generous rate limits (6000 weight/min)
+- REST polling is simpler than WebSocket for v1 -- no connection lifecycle management, reconnection logic, or partial message handling
+- Single binary with goroutines is appropriate for 3 symbols x 3 data types (9 workers) -- no microservice overhead needed
+- `/api/v3/aggTrades` (weight=2) is 12.5x cheaper than `/api/v3/trades` (weight=25) on rate budget
 
----
+### Rejected Alternatives
 
-## 2. Binance Public API Endpoints
+- **WebSocket streaming** -- Adds connection lifecycle management, heartbeat logic, reconnection with gap detection. Overkill for 3 symbols at 5s intervals. Defer to v1.1. (All 3 teams agree)
+- **Multiple exchanges** -- Scope creep. Binance alone covers all three assets. Multi-exchange support can be added later. (All 3 teams agree)
+- **Microservice per data type** -- Unnecessary coordination cost for 9 workers. Single binary is simpler to deploy, monitor, and debug. (All 3 teams agree)
+- **Historical backfill in v1** -- `/api/v3/historicalTrades` requires API key. Start with real-time forward-only ingestion. (All 3 teams agree)
+- **Prometheus metrics in v1** -- Adds dependency for an internal dev tool. Structured `slog` logging is sufficient. Defer to v1.1. (All 3 teams agree)
+- **FATAL exit on HTTP 418** -- With `restart: unless-stopped` in docker-compose, fatal exit creates a restart loop that hammers Binance repeatedly, potentially extending the IP ban duration. Stop workers + 503 healthz is strictly superior. (Charlie-Skeptic won this debate; Alpha+Bravo conceded)
+- **Premature Fetcher interface** -- No interface abstraction in v1. Concrete Binance client only. Defer interface extraction to multi-exchange milestone. (Alpha-Skeptic, adopted by all)
 
-All endpoints below are **public** and require **no authentication** (no API key, no HMAC signing, no account).
+### Binance API Endpoints (Verified by 3 independent Verifiers)
 
-### 2.1 Recent Trades
+| Endpoint | Weight | Data | Auth Required |
+|----------|--------|------|---------------|
+| `GET /api/v3/aggTrades?symbol=BTCUSDT&limit=1000` | 2 | Aggregated trades (price, qty, time, trade ID) | No |
+| `GET /api/v3/depth?symbol=BTCUSDT&limit=20` | 2 | Order book (bids + asks at 20 levels) | No |
+| `GET /api/v3/ticker/24hr?symbol=BTCUSDT` | 2 | 24hr rolling stats (OHLC, volume, trade count) | No |
+| `GET /api/v3/exchangeInfo?symbols=["BTCUSDT","ETHUSDT","ETHBTC"]` | 20 | Symbol metadata (precision, status) | No |
+| `GET /api/v3/ping` | 1 | Connectivity test | No |
 
-**Endpoint:** `GET /api/v3/trades`
+Trading pairs: **BTCUSDT**, **ETHUSDT**, **ETHBTC** (covers all BTC/ETH/USDT relationships)
 
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `symbol`  | Yes      | e.g., `BTCUSDT` |
-| `limit`   | No       | Default 500, max 1000 |
-
-**Response fields:**
-- `id` -- trade ID (unique per symbol, monotonically increasing)
-- `price` -- trade price as string
-- `qty` -- trade quantity as string
-- `quoteQty` -- quote asset quantity (price * qty)
-- `time` -- trade timestamp in milliseconds (Unix epoch)
-- `isBuyerMaker` -- boolean: true if the buyer was the maker
-- `isBestMatch` -- boolean: true if the trade was the best price match
-
-**Rate limit weight:** 25 per request (at limit=1000)
-
-### 2.2 Historical Trades (Older Trades)
-
-**Endpoint:** `GET /api/v3/historicalTrades`
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `symbol`  | Yes      | e.g., `BTCUSDT` |
-| `limit`   | No       | Default 500, max 1000 |
-| `fromId`  | No       | Trade ID to fetch from (for pagination) |
-
-**Note:** This endpoint requires an API key header (`X-MBX-APIKEY`) but does NOT require signing (no secret key needed). A free Binance API key (no account balance needed) unlocks this. For initial implementation, use `/api/v3/trades` (fully public, no key). Add historical trades support later if backfill is needed.
-
-**Rate limit weight:** 25 per request
-
-### 2.3 Aggregate Trades (Compressed Trades)
-
-**Endpoint:** `GET /api/v3/aggTrades`
-
-| Parameter   | Required | Description |
-|-------------|----------|-------------|
-| `symbol`    | Yes      | e.g., `BTCUSDT` |
-| `fromId`    | No       | Aggregate trade ID to fetch from |
-| `startTime` | No       | Start timestamp (ms) |
-| `endTime`   | No       | End timestamp (ms) |
-| `limit`     | No       | Default 500, max 1000 |
-
-**Response fields:**
-- `a` -- aggregate trade ID
-- `p` -- price
-- `q` -- quantity
-- `f` -- first trade ID
-- `l` -- last trade ID
-- `T` -- timestamp (ms)
-- `m` -- was the buyer the maker?
-- `M` -- was the trade the best price match?
-
-**Rate limit weight:** 2 per request (much cheaper than /trades)
-
-This is the **preferred endpoint for trade ingestion** due to low rate limit cost, time-range filtering, and pagination by ID.
-
-### 2.4 Order Book / Market Depth
-
-**Endpoint:** `GET /api/v3/depth`
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `symbol`  | Yes      | e.g., `BTCUSDT` |
-| `limit`   | No       | Default 100. Valid: 5, 10, 20, 50, 100, 500, 1000, 5000 |
-
-**Response fields:**
-- `lastUpdateId` -- sequence number for the snapshot
-- `bids` -- array of `[price, quantity]` pairs (sorted best to worst)
-- `asks` -- array of `[price, quantity]` pairs (sorted best to worst)
-
-**Rate limit weight:** 5 (limit=100), 10 (limit=500), 50 (limit=1000), 250 (limit=5000)
-
-### 2.5 Ticker Price (Latest Price)
-
-**Endpoint:** `GET /api/v3/ticker/price`
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `symbol`  | No       | Single symbol. Omit for all symbols. |
-
-**Response fields:**
-- `symbol` -- trading pair
-- `price` -- latest price as string
-
-**Rate limit weight:** 2 (single symbol), 4 (all symbols)
-
-### 2.6 24hr Ticker Statistics
-
-**Endpoint:** `GET /api/v3/ticker/24hr`
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `symbol`  | No       | Single symbol |
-
-**Response fields (selected):**
-- `symbol`, `priceChange`, `priceChangePercent`
-- `weightedAvgPrice`, `prevClosePrice`
-- `lastPrice`, `lastQty`
-- `bidPrice`, `bidQty`, `askPrice`, `askQty`
-- `openPrice`, `highPrice`, `lowPrice`
-- `volume` (base), `quoteVolume` (quote)
-- `openTime`, `closeTime`
-- `firstId`, `lastId`, `count` (trade count)
-
-**Rate limit weight:** 2 (single symbol), 80 (all symbols)
-
-### 2.7 Kline/Candlestick Data
-
-**Endpoint:** `GET /api/v3/klines`
-
-| Parameter   | Required | Description |
-|-------------|----------|-------------|
-| `symbol`    | Yes      | e.g., `BTCUSDT` |
-| `interval`  | Yes      | e.g., `1m`, `5m`, `1h`, `1d` |
-| `startTime` | No       | Start timestamp (ms) |
-| `endTime`   | No       | End timestamp (ms) |
-| `limit`     | No       | Default 500, max 1000 |
-
-**Response:** Array of arrays: `[openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, numberOfTrades, takerBuyBaseVol, takerBuyQuoteVol, ignore]`
-
-**Rate limit weight:** 2 per request
-
-### 2.8 Exchange Information
-
-**Endpoint:** `GET /api/v3/exchangeInfo`
-
-| Parameter  | Required | Description |
-|------------|----------|-------------|
-| `symbol`   | No       | Single symbol |
-| `symbols`  | No       | JSON array of symbols |
-
-**Response fields (per symbol):**
-- `symbol`, `status`, `baseAsset`, `quoteAsset`
-- `baseAssetPrecision`, `quoteAssetPrecision`, `quotePrecision`
-- `filters` -- array of trading rules (price filter, lot size, etc.)
-- `orderTypes`, `icebergAllowed`, `isSpotTradingAllowed`
-- `permissions`
-
-**Rate limit weight:** 20
-
-### 2.9 Rate Limits Summary
-
-Binance enforces IP-based rate limits on public endpoints:
-- **6000 weight per minute** per IP for REST API
-- Each endpoint has a "weight" cost (listed above)
-- Exceeding limits returns HTTP 429 with `Retry-After` header
-- Response headers include: `X-MBX-USED-WEIGHT-1m` (current weight usage)
-
-**Budget calculation for our use case (3 symbols, polling every 5 seconds):**
-
-| Endpoint       | Weight | Calls/min | Total Weight/min |
-|----------------|--------|-----------|------------------|
-| aggTrades x3   | 2      | 36        | 72               |
-| depth x3       | 5      | 36        | 180              |
-| ticker/24hr x3 | 2      | 12        | 24               |
-| **Total**      |        |           | **276**          |
-
-This uses ~4.6% of the 6000/min budget, leaving substantial headroom.
-
----
-
-## 3. Overall Architecture
+### Architecture
 
 ```
-+-------------------+     +------------------+     +------------+
-|  Binance REST API |---->|  Go Worker Pool  |---->| PostgreSQL |
-|  (public, no auth)|     |  (3 goroutines   |     | (pipeline  |
-+-------------------+     |   per data type)  |     |  database) |
-                          +------------------+     +------------+
-                                  |
-                          +-------v--------+
-                          |  Rate Limiter  |
-                          |  (token bucket)|
-                          +----------------+
+Binance REST API (public, no auth)
+        |
+        v
+Go binary: crypto-ingest (single Docker container)
+  +-- Trade Workers      (1 goroutine per symbol, 3 total, 5s poll)
+  +-- OrderBook Workers  (1 goroutine per symbol, 3 total, 5s poll)
+  +-- Ticker Workers     (1 goroutine per symbol, 3 total, 30s poll)
+  +-- Metadata Loader    (fetches exchangeInfo once at startup)
+  +-- Health Endpoint    (:8085/healthz, self-probe via --healthcheck flag)
+  +-- Shared Token Bucket Rate Limiter (5000 weight/min, 83% of 6000 limit)
+  +-- Server-Side Rate Monitor (X-MBX-USED-WEIGHT-1m header, pause at 95%)
+  +-- PostgreSQL Batch Writer (pgx.Batch + ON CONFLICT for trades, COPY for orderbook/ticker)
+        |
+        v
+PostgreSQL (existing `pipeline` database, new `crypto` schema)
+  +-- crypto.symbols              (symbol metadata)
+  +-- crypto.agg_trades           (executed trades, deduped by agg_trade_id)
+  +-- crypto.orderbook_snapshots  (snapshot headers with depth_level)
+  +-- crypto.orderbook_levels     (individual price levels per snapshot, no FK)
+  +-- crypto.ticker_24hr          (24hr rolling stats, full column set)
+  +-- crypto.ingest_state         (high-water marks for resumable ingestion)
 ```
 
-### Components
+### Rate Limit Budget (at default settings)
 
-1. **Go binary: `crypto-ingest`** -- single binary, runs as a Docker container alongside the existing stack
-2. **Three worker types:**
-   - **Trade Worker** -- polls `/api/v3/aggTrades`, one goroutine per symbol (3 total)
-   - **OrderBook Worker** -- polls `/api/v3/depth`, one goroutine per symbol (3 total)
-   - **Ticker Worker** -- polls `/api/v3/ticker/24hr`, one goroutine per symbol (3 total)
-3. **Shared rate limiter** -- token bucket, 6000 tokens/minute capacity, shared across all goroutines
-4. **PostgreSQL writer** -- batched inserts using `pgx` copy protocol for high throughput
-5. **Exchange metadata loader** -- fetches `/api/v3/exchangeInfo` once at startup, refreshes hourly
+| Worker Type | Symbols | Interval | Weight/Call | Calls/Min | Weight/Min |
+|-------------|---------|----------|-------------|-----------|------------|
+| aggTrades   | 3       | 5s       | 2           | 36        | 72         |
+| depth (20)  | 3       | 5s       | 2           | 36        | 72         |
+| ticker      | 3       | 30s      | 2           | 6         | 12         |
+| exchangeInfo| 1       | startup  | 20          | ~0        | ~0         |
+| **Total**   |         |          |             | **78**    | **156**    |
 
-### Data Flow
+Budget: 156/5000 allocated = 3.1% of safety-capped limit. Massive headroom for scaling to more pairs.
 
-1. Worker goroutine wakes up on ticker interval
-2. Acquires rate limit tokens (weight of the request)
-3. Makes HTTP GET to Binance API
-4. Parses JSON response, normalizes to internal structs
-5. Deduplicates against last-seen IDs (for trades) or timestamps (for snapshots)
-6. Batches rows and flushes to PostgreSQL via COPY protocol
-7. Updates high-water marks (last trade ID, last snapshot timestamp)
-8. Sleeps until next tick
+### Scope
 
----
+**Files to CREATE (~16 new files):**
 
-## 4. Go Worker Architecture
+| File | Purpose |
+|------|---------|
+| `crypto-ingest/go.mod` | Go module definition |
+| `crypto-ingest/cmd/ingest/main.go` | Application entrypoint, config validation, wiring |
+| `crypto-ingest/internal/config/config.go` | Environment variable parsing |
+| `crypto-ingest/internal/client/binance.go` | Binance REST API client + response types |
+| `crypto-ingest/internal/client/ratelimit.go` | Token bucket wrapper (`golang.org/x/time/rate`) |
+| `crypto-ingest/internal/model/*.go` | Structs for AggTrade, OrderBook, Ticker, Symbol (coder decides file granularity) |
+| `crypto-ingest/internal/worker/trade.go` | Trade polling goroutine |
+| `crypto-ingest/internal/worker/orderbook.go` | Order book polling goroutine |
+| `crypto-ingest/internal/worker/ticker.go` | Ticker polling goroutine |
+| `crypto-ingest/internal/worker/manager.go` | Worker lifecycle, graceful shutdown, health endpoint |
+| `crypto-ingest/internal/store/postgres.go` | pgx pool, batch inserts, COPY for orderbook/ticker |
+| `crypto-ingest/internal/store/migrations.go` | CREATE SCHEMA/TABLE IF NOT EXISTS on startup |
+| `crypto-ingest/Dockerfile` | Multi-stage build |
+| `scripts/verify_crypto_e2e.sh` | Automated E2E check |
 
-### 4.1 Project Structure
+**Files to MODIFY (2 files):**
 
-```
-crypto-ingest/
-  cmd/
-    ingest/
-      main.go              -- entrypoint, config loading, signal handling
-  internal/
-    config/
-      config.go            -- configuration struct, env/flag parsing
-    client/
-      binance.go           -- HTTP client for Binance API, response types
-      ratelimit.go         -- token bucket rate limiter
-    model/
-      trade.go             -- AggTrade struct
-      orderbook.go         -- OrderBookSnapshot, OrderBookLevel structs
-      ticker.go            -- Ticker24hr struct
-      symbol.go            -- SymbolInfo struct (from exchangeInfo)
-    worker/
-      trade.go             -- trade polling worker
-      orderbook.go         -- order book polling worker
-      ticker.go            -- ticker polling worker
-      manager.go           -- starts/stops all workers, coordinates shutdown
-    store/
-      postgres.go          -- pgx connection pool, batch insert methods
-      migrations.go        -- schema creation (DDL execution on startup)
-  go.mod
-  go.sum
-  Dockerfile
-```
+| File | Change |
+|------|--------|
+| `docker/postgres/init.sql` | Add `CREATE SCHEMA IF NOT EXISTS crypto;` |
+| `docker-compose.yml` | Add `crypto-ingest` service with healthcheck |
 
-### 4.2 Configuration (`internal/config/config.go`)
+### PostgreSQL Schema (crypto schema)
 
-All configuration via environment variables (12-factor app):
-
-| Env Variable              | Default                          | Description |
-|---------------------------|----------------------------------|-------------|
-| `BINANCE_BASE_URL`        | `https://api.binance.com`        | API base URL |
-| `BINANCE_SYMBOLS`         | `BTCUSDT,ETHUSDT,ETHBTC`        | Comma-separated symbols |
-| `TRADE_POLL_INTERVAL`     | `5s`                             | How often to poll aggTrades |
-| `ORDERBOOK_POLL_INTERVAL` | `5s`                             | How often to poll depth |
-| `ORDERBOOK_DEPTH`         | `100`                            | Depth levels to fetch (5/10/20/50/100/500/1000) |
-| `TICKER_POLL_INTERVAL`    | `30s`                            | How often to poll 24hr ticker |
-| `RATE_LIMIT_PER_MINUTE`   | `5000`                           | Token bucket capacity (below Binance's 6000 for safety) |
-| `BATCH_SIZE`              | `500`                            | Rows per batch insert |
-| `BATCH_FLUSH_INTERVAL`    | `2s`                             | Max time before flushing partial batch |
-| `POSTGRES_DSN`            | (required, from `.env`)          | PostgreSQL connection string |
-| `LOG_LEVEL`               | `info`                           | Logging level: debug/info/warn/error |
-
-### 4.3 HTTP Client (`internal/client/binance.go`)
-
-- Use Go standard library `net/http` with a shared `http.Client` (connection pooling via default transport)
-- Set `http.Client.Timeout` to 10 seconds
-- Parse JSON responses using `encoding/json` (no external JSON library needed)
-- Read `X-MBX-USED-WEIGHT-1m` header from every response to track actual rate limit usage
-- On HTTP 429: log warning, read `Retry-After` header, sleep for that duration, then retry once
-- On HTTP 418 (IP ban): log error, halt all workers, exit with code 1 (requires manual intervention)
-- On HTTP 5xx: retry with exponential backoff (1s, 2s, 4s, max 3 retries)
-
-Response structs:
-
-```go
-type AggTradeResponse struct {
-    AggTradeID   int64  `json:"a"`
-    Price        string `json:"p"`
-    Quantity     string `json:"q"`
-    FirstTradeID int64  `json:"f"`
-    LastTradeID  int64  `json:"l"`
-    Timestamp    int64  `json:"T"`
-    IsBuyerMaker bool   `json:"m"`
-    IsBestMatch  bool   `json:"M"`
-}
-
-type DepthResponse struct {
-    LastUpdateID int64      `json:"lastUpdateId"`
-    Bids         [][]string `json:"bids"`
-    Asks         [][]string `json:"asks"`
-}
-
-type Ticker24hrResponse struct {
-    Symbol             string `json:"symbol"`
-    PriceChange        string `json:"priceChange"`
-    PriceChangePercent string `json:"priceChangePercent"`
-    WeightedAvgPrice   string `json:"weightedAvgPrice"`
-    LastPrice          string `json:"lastPrice"`
-    LastQty            string `json:"lastQty"`
-    BidPrice           string `json:"bidPrice"`
-    BidQty             string `json:"bidQty"`
-    AskPrice           string `json:"askPrice"`
-    AskQty             string `json:"askQty"`
-    OpenPrice          string `json:"openPrice"`
-    HighPrice          string `json:"highPrice"`
-    LowPrice           string `json:"lowPrice"`
-    Volume             string `json:"volume"`
-    QuoteVolume        string `json:"quoteVolume"`
-    OpenTime           int64  `json:"openTime"`
-    CloseTime          int64  `json:"closeTime"`
-    FirstID            int64  `json:"firstId"`
-    LastID             int64  `json:"lastId"`
-    Count              int64  `json:"count"`
-}
-```
-
-### 4.4 Rate Limiter (`internal/client/ratelimit.go`)
-
-Token bucket implementation:
-- Capacity: configurable (default 5000 tokens per minute, below Binance's 6000 limit for safety margin)
-- Refill: tokens refill continuously (5000/60 = ~83.3 tokens/second)
-- Each API call consumes tokens equal to its weight before executing
-- If insufficient tokens, the goroutine blocks until tokens are available
-- Use `golang.org/x/time/rate` package (`rate.NewLimiter`) -- it implements token bucket natively
-- `rate.NewLimiter(rate.Limit(5000.0/60.0), 5000)` -- rate of ~83.3/sec, burst of 5000
-
-Usage:
-```go
-limiter.WaitN(ctx, weight)  // blocks until weight tokens available
-```
-
-### 4.5 Trade Worker (`internal/worker/trade.go`)
-
-Per-symbol goroutine logic:
-
-1. On startup, query PostgreSQL for the highest `agg_trade_id` for this symbol -- this is the high-water mark
-2. Loop on ticker interval (default 5s):
-   a. Call `limiter.WaitN(ctx, 2)` (aggTrades weight = 2)
-   b. `GET /api/v3/aggTrades?symbol={symbol}&fromId={lastID+1}&limit=1000`
-   c. If `lastID` is 0 (first run), omit `fromId` to get most recent trades
-   d. Parse response into `[]AggTradeResponse`
-   e. Filter out any trades with `AggTradeID <= lastID` (safety dedup)
-   f. Convert to internal model, batch insert into `crypto.agg_trades`
-   g. Update `lastID` to max `AggTradeID` from this batch
-   h. If response returned exactly 1000 trades, immediately loop again (there may be more) without sleeping
-3. On context cancellation (shutdown signal), flush remaining batch and exit
-
-### 4.6 OrderBook Worker (`internal/worker/orderbook.go`)
-
-Per-symbol goroutine logic:
-
-1. Loop on ticker interval (default 5s):
-   a. Call `limiter.WaitN(ctx, 5)` (depth weight = 5 at limit=100)
-   b. `GET /api/v3/depth?symbol={symbol}&limit=100`
-   c. Parse response into `DepthResponse`
-   d. Assign `snapshot_time = time.Now().UTC()` (server-side timestamp not provided for REST depth)
-   e. Convert bids/asks arrays into `[]OrderBookLevel` rows
-   f. Batch insert snapshot header into `crypto.orderbook_snapshots` (returns `snapshot_id`)
-   g. Batch insert levels into `crypto.orderbook_levels` with the `snapshot_id`
-2. On context cancellation, exit cleanly
-
-### 4.7 Ticker Worker (`internal/worker/ticker.go`)
-
-Per-symbol goroutine logic:
-
-1. Loop on ticker interval (default 30s):
-   a. Call `limiter.WaitN(ctx, 2)` (ticker/24hr weight = 2 for single symbol)
-   b. `GET /api/v3/ticker/24hr?symbol={symbol}`
-   c. Parse response into `Ticker24hrResponse`
-   d. Insert into `crypto.ticker_24hr`
-2. On context cancellation, exit cleanly
-
-### 4.8 Worker Manager (`internal/worker/manager.go`)
-
-- Creates a shared `context.Context` with cancellation
-- Starts all workers as goroutines
-- Listens for OS signals (`SIGINT`, `SIGTERM`)
-- On signal: cancels context, waits for all goroutines to finish (with a 10-second deadline)
-- Reports worker errors via a shared error channel
-- If any worker returns a fatal error (e.g., IP ban), cancels all workers
-
-### 4.9 Data Parsing and Normalization
-
-Binance returns prices and quantities as **strings** (to preserve decimal precision). The Go code must:
-
-1. Parse price/quantity strings into `decimal.Decimal` using `shopspring/decimal` library (avoids float64 precision loss)
-2. Store in PostgreSQL as `NUMERIC` type
-3. Timestamps from Binance are Unix milliseconds -- convert to `time.Time` with `time.UnixMilli(ts).UTC()`
-4. All timestamps stored in UTC
-5. Boolean fields (`is_buyer_maker`) stored as PostgreSQL `BOOLEAN`
-
----
-
-## 5. PostgreSQL Schema
-
-All tables in schema `crypto` within the existing `pipeline` database.
-
-### 5.1 Schema Creation
-
-Add to `docker/postgres/init.sql`:
-
-```sql
-CREATE SCHEMA IF NOT EXISTS crypto;
-```
-
-### 5.2 Table: `crypto.symbols`
-
-Metadata about trading pairs, populated from `/api/v3/exchangeInfo` at startup.
-
+**crypto.symbols**
 ```sql
 CREATE TABLE IF NOT EXISTS crypto.symbols (
-    symbol              TEXT        NOT NULL,
-    status              TEXT        NOT NULL,
-    base_asset          TEXT        NOT NULL,
-    quote_asset         TEXT        NOT NULL,
-    base_precision      INTEGER     NOT NULL,
-    quote_precision     INTEGER     NOT NULL,
-    filters_json        JSONB,
-    fetched_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (symbol)
+    symbol          TEXT        PRIMARY KEY,
+    status          TEXT        NOT NULL,
+    base_asset      TEXT        NOT NULL,
+    quote_asset     TEXT        NOT NULL,
+    base_precision  INTEGER     NOT NULL,
+    quote_precision INTEGER     NOT NULL,
+    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-### 5.3 Table: `crypto.agg_trades`
-
-Aggregate trade data from `/api/v3/aggTrades`.
-
+**crypto.agg_trades**
 ```sql
 CREATE TABLE IF NOT EXISTS crypto.agg_trades (
-    symbol              TEXT        NOT NULL,
-    agg_trade_id        BIGINT      NOT NULL,
-    price               NUMERIC     NOT NULL,
-    quantity            NUMERIC     NOT NULL,
-    first_trade_id      BIGINT      NOT NULL,
-    last_trade_id       BIGINT      NOT NULL,
-    trade_time          TIMESTAMPTZ NOT NULL,
-    is_buyer_maker      BOOLEAN     NOT NULL,
-    is_best_match       BOOLEAN     NOT NULL,
-    ingested_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    symbol          TEXT        NOT NULL,
+    agg_trade_id    BIGINT      NOT NULL,
+    price           NUMERIC     NOT NULL,
+    quantity        NUMERIC     NOT NULL,
+    first_trade_id  BIGINT      NOT NULL,
+    last_trade_id   BIGINT      NOT NULL,
+    trade_time      TIMESTAMPTZ NOT NULL,
+    is_buyer_maker  BOOLEAN     NOT NULL,
+    is_best_match   BOOLEAN     NOT NULL,
+    inserted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (symbol, agg_trade_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_agg_trades_time
+CREATE INDEX IF NOT EXISTS idx_agg_trades_symbol_time
     ON crypto.agg_trades (symbol, trade_time);
 ```
 
-**Partitioning consideration:** For production scale, this table should be partitioned by `trade_time` (monthly ranges). For the initial implementation with 3 symbols, a simple table with the composite primary key and time index is sufficient. Partitioning can be added later without schema changes to the Go code (transparent to the application).
-
-**Deduplication:** The composite primary key `(symbol, agg_trade_id)` guarantees idempotency. On conflict, use `ON CONFLICT DO NOTHING` to silently skip duplicates.
-
-### 5.4 Table: `crypto.orderbook_snapshots`
-
-Snapshot metadata for order book captures.
-
+**crypto.orderbook_snapshots**
 ```sql
 CREATE TABLE IF NOT EXISTS crypto.orderbook_snapshots (
-    snapshot_id         BIGSERIAL   NOT NULL,
-    symbol              TEXT        NOT NULL,
-    last_update_id      BIGINT      NOT NULL,
-    snapshot_time       TIMESTAMPTZ NOT NULL,
-    bid_count           INTEGER     NOT NULL,
-    ask_count           INTEGER     NOT NULL,
-    ingested_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (snapshot_id)
+    snapshot_id     BIGSERIAL   PRIMARY KEY,
+    symbol          TEXT        NOT NULL,
+    last_update_id  BIGINT      NOT NULL,
+    depth_level     INTEGER     NOT NULL,
+    snapshot_time   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
 CREATE INDEX IF NOT EXISTS idx_ob_snapshots_symbol_time
     ON crypto.orderbook_snapshots (symbol, snapshot_time);
 ```
 
-### 5.5 Table: `crypto.orderbook_levels`
-
-Individual price levels within each snapshot.
-
+**crypto.orderbook_levels** (no FK -- unanimous across all 12 agents)
 ```sql
 CREATE TABLE IF NOT EXISTS crypto.orderbook_levels (
-    snapshot_id         BIGINT      NOT NULL REFERENCES crypto.orderbook_snapshots(snapshot_id),
-    side                TEXT        NOT NULL CHECK (side IN ('bid', 'ask')),
-    level_index         SMALLINT    NOT NULL,
-    price               NUMERIC     NOT NULL,
-    quantity            NUMERIC     NOT NULL,
+    snapshot_id     BIGINT      NOT NULL,
+    side            TEXT        NOT NULL CHECK (side IN ('bid', 'ask')),
+    level_index     SMALLINT    NOT NULL,
+    price           NUMERIC     NOT NULL,
+    quantity        NUMERIC     NOT NULL,
     PRIMARY KEY (snapshot_id, side, level_index)
 );
 ```
 
-**Note:** Storing every level of every snapshot generates significant data volume. At 100 levels * 2 sides * 3 symbols * 12 snapshots/min = ~43,200 rows/min = ~62M rows/day. For the initial implementation this is acceptable for a local dev environment. For production, consider:
-- Reducing depth to 20 levels
-- Reducing polling frequency to 15-30 seconds
-- Adding a retention policy (delete snapshots older than N days)
-
-### 5.6 Table: `crypto.ticker_24hr`
-
-Rolling 24-hour ticker statistics.
-
+**crypto.ticker_24hr** (fuller column set -- Bravo, adopted by swarm)
 ```sql
 CREATE TABLE IF NOT EXISTS crypto.ticker_24hr (
-    id                      BIGSERIAL   NOT NULL,
-    symbol                  TEXT        NOT NULL,
-    price_change            NUMERIC     NOT NULL,
-    price_change_percent    NUMERIC     NOT NULL,
-    weighted_avg_price      NUMERIC     NOT NULL,
-    last_price              NUMERIC     NOT NULL,
-    last_qty                NUMERIC     NOT NULL,
-    bid_price               NUMERIC     NOT NULL,
-    bid_qty                 NUMERIC     NOT NULL,
-    ask_price               NUMERIC     NOT NULL,
-    ask_qty                 NUMERIC     NOT NULL,
-    open_price              NUMERIC     NOT NULL,
-    high_price              NUMERIC     NOT NULL,
-    low_price               NUMERIC     NOT NULL,
-    volume                  NUMERIC     NOT NULL,
-    quote_volume            NUMERIC     NOT NULL,
-    open_time               TIMESTAMPTZ NOT NULL,
-    close_time              TIMESTAMPTZ NOT NULL,
-    first_trade_id          BIGINT      NOT NULL,
-    last_trade_id           BIGINT      NOT NULL,
-    trade_count             BIGINT      NOT NULL,
-    fetched_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id)
+    id              BIGSERIAL   PRIMARY KEY,
+    symbol          TEXT        NOT NULL,
+    price_change    NUMERIC     NOT NULL,
+    price_change_pct NUMERIC   NOT NULL,
+    weighted_avg    NUMERIC     NOT NULL,
+    prev_close      NUMERIC     NOT NULL,
+    last_price      NUMERIC     NOT NULL,
+    last_qty        NUMERIC     NOT NULL,
+    bid_price       NUMERIC     NOT NULL,
+    bid_qty         NUMERIC     NOT NULL,
+    ask_price       NUMERIC     NOT NULL,
+    ask_qty         NUMERIC     NOT NULL,
+    open_price      NUMERIC     NOT NULL,
+    high_price      NUMERIC     NOT NULL,
+    low_price       NUMERIC     NOT NULL,
+    volume          NUMERIC     NOT NULL,
+    quote_volume    NUMERIC     NOT NULL,
+    open_time       TIMESTAMPTZ NOT NULL,
+    close_time      TIMESTAMPTZ NOT NULL,
+    first_trade_id  BIGINT      NOT NULL,
+    last_trade_id   BIGINT      NOT NULL,
+    trade_count     BIGINT      NOT NULL,
+    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX IF NOT EXISTS idx_ticker_symbol_fetched
+CREATE INDEX IF NOT EXISTS idx_ticker_symbol_time
     ON crypto.ticker_24hr (symbol, fetched_at);
 ```
 
-### 5.7 Table: `crypto.ingest_state`
-
-Tracks high-water marks for each worker to enable resumable ingestion.
-
+**crypto.ingest_state**
 ```sql
 CREATE TABLE IF NOT EXISTS crypto.ingest_state (
-    worker_type         TEXT        NOT NULL,
-    symbol              TEXT        NOT NULL,
-    last_id             BIGINT      NOT NULL DEFAULT 0,
-    last_timestamp      TIMESTAMPTZ,
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    worker_type     TEXT        NOT NULL,
+    symbol          TEXT        NOT NULL,
+    last_id         BIGINT,
+    last_timestamp  TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (worker_type, symbol)
 );
 ```
 
-The trade worker updates `last_id` with the highest `agg_trade_id` after each successful batch. On startup, it reads this value to resume from where it left off.
-
----
-
-## 6. Batching and Polling Strategy
-
-### Approach: Polling with Adaptive Catch-Up
-
-- **Primary strategy:** Periodic polling via `time.Ticker` per worker
-- **Catch-up mode:** When a trade poll returns the maximum 1000 records, the worker immediately polls again (without sleeping) to catch up to the present. This handles both initial startup and periods where the worker fell behind.
-- **No WebSocket for v1:** WebSocket would provide lower latency but adds connection management complexity. REST polling at 5-second intervals is sufficient for the stated requirements. WebSocket can be added as a future enhancement.
-
-### Batch Inserts
-
-- Use `pgx` COPY protocol (`pgx.CopyFrom`) for maximum insert throughput
-- Buffer rows in memory up to `BATCH_SIZE` (default 500)
-- Flush buffer when either:
-  - Buffer reaches `BATCH_SIZE` rows, OR
-  - `BATCH_FLUSH_INTERVAL` (default 2s) has elapsed since last flush
-- For `agg_trades`: use `ON CONFLICT (symbol, agg_trade_id) DO NOTHING` -- this requires using regular batch INSERT instead of COPY. Use `pgx.Batch` for this.
-- For `orderbook_levels` and `ticker_24hr`: COPY protocol is safe since snapshot_id is generated by the DB (no conflicts)
-
----
-
-## 7. Error Handling and Retry Strategy
-
-### HTTP Errors
-
-| HTTP Status | Action |
-|-------------|--------|
-| 200         | Process response normally |
-| 429         | Log warning, sleep for `Retry-After` seconds, retry once. If still 429, back off for 60 seconds. |
-| 418         | IP banned. Log FATAL, cancel all workers, exit code 1. |
-| 400         | Bad request (likely invalid symbol). Log error, skip this cycle, do NOT retry. |
-| 5xx         | Exponential backoff: 1s, 2s, 4s. Max 3 retries per request. After 3 failures, log error and skip this cycle. |
-| Network err | Same as 5xx -- exponential backoff with 3 retries. |
-
-### PostgreSQL Errors
-
-| Error Type | Action |
-|------------|--------|
-| Connection lost | Retry connection with exponential backoff (1s, 2s, 4s, 8s, 16s). `pgxpool` handles this automatically via its internal reconnection logic. |
-| Unique violation | Expected for `agg_trades` dedup. Use `ON CONFLICT DO NOTHING`, no retry needed. |
-| Disk full / other fatal | Log FATAL, exit code 1. |
-
-### Graceful Shutdown
-
-- On `SIGINT` / `SIGTERM`: cancel the root context
-- Each worker's loop checks `ctx.Done()` at the top of each iteration
-- Workers flush any buffered but unwritten rows before exiting
-- Main goroutine waits up to 10 seconds for all workers to finish, then force-exits
-
----
-
-## 8. Idempotency and Deduplication
-
-### Trades (`crypto.agg_trades`)
-
-- **Primary key:** `(symbol, agg_trade_id)` -- Binance aggregate trade IDs are globally unique per symbol and monotonically increasing
-- **Insert strategy:** `INSERT INTO crypto.agg_trades (...) VALUES (...) ON CONFLICT (symbol, agg_trade_id) DO NOTHING`
-- **High-water mark:** After each successful batch insert, update `crypto.ingest_state` with the max `agg_trade_id`. On restart, resume from `last_id + 1`.
-- **Guarantee:** Even if the worker crashes mid-batch, restarting will re-fetch overlapping trades, and the `ON CONFLICT` clause silently drops duplicates. No data loss, no duplicates.
-
-### Order Book Snapshots
-
-- Snapshots are inherently non-idempotent (each poll creates a new snapshot). This is acceptable -- they are time-series point-in-time captures.
-- `snapshot_id` is auto-generated by PostgreSQL `BIGSERIAL`.
-- If the same `last_update_id` is captured twice (e.g., the order book didn't change between polls), both snapshots are stored. This is intentional for time-series completeness. A downstream consumer can deduplicate on `(symbol, last_update_id)` if needed.
-
-### Ticker 24hr
-
-- Similar to order book -- time-series captures. Each poll stores a new row.
-- Downstream analytics can use `fetched_at` for deduplication or time-windowed aggregation.
-
----
-
-## 9. Logging and Monitoring
-
-### Logging
-
-- Use `log/slog` (Go 1.21+ structured logging, part of standard library)
-- JSON output format for machine parsing
-- Log levels: DEBUG (HTTP request/response details), INFO (batch sizes, high-water marks), WARN (rate limits, retries), ERROR (failed requests, DB errors)
-- Every log line includes: `timestamp`, `level`, `worker` (e.g., `trade/BTCUSDT`), `message`, and relevant structured fields
-
-Key log events:
-- Worker started/stopped
-- Batch inserted (symbol, row_count, duration_ms)
-- Rate limit approaching (current weight usage from `X-MBX-USED-WEIGHT-1m` header)
-- Retry triggered (endpoint, attempt, delay)
-- High-water mark updated (symbol, last_id)
-
-### Monitoring (Recommendations for Future)
-
-- Expose Prometheus metrics on `:9090/metrics` (use `prometheus/client_golang`)
-- Key metrics:
-  - `crypto_ingest_trades_total` (counter, by symbol)
-  - `crypto_ingest_orderbook_snapshots_total` (counter, by symbol)
-  - `crypto_ingest_http_requests_total` (counter, by endpoint, status_code)
-  - `crypto_ingest_http_request_duration_seconds` (histogram, by endpoint)
-  - `crypto_ingest_rate_limit_remaining` (gauge)
-  - `crypto_ingest_batch_size` (histogram, by table)
-  - `crypto_ingest_lag_seconds` (gauge, by symbol -- difference between now and latest trade_time)
-- This is out of scope for v1 but the architecture supports it cleanly
-
----
-
-## 10. Docker Integration
-
-### New Files
-
-| File | Purpose |
-|------|---------|
-| `crypto-ingest/Dockerfile` | Multi-stage Go build, final image based on `gcr.io/distroless/static-debian12:nonroot` |
-| `crypto-ingest/cmd/ingest/main.go` | Entrypoint |
-| `crypto-ingest/internal/...` | All Go packages as described above |
-| `crypto-ingest/go.mod` | Go module definition |
-
-### Docker Compose Addition
-
-Add to the existing `docker-compose.yml`:
-
-```yaml
-  crypto-ingest:
-    build:
-      context: ./crypto-ingest
-      dockerfile: Dockerfile
-    image: crypto-ingest:0.1.0
-    container_name: crypto-ingest
-    environment:
-      POSTGRES_DSN: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
-      BINANCE_SYMBOLS: "BTCUSDT,ETHUSDT,ETHBTC"
-      TRADE_POLL_INTERVAL: "5s"
-      ORDERBOOK_POLL_INTERVAL: "5s"
-      ORDERBOOK_DEPTH: "100"
-      TICKER_POLL_INTERVAL: "30s"
-      LOG_LEVEL: "info"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 256m
-    networks:
-      - data-pipeline
-```
-
-### Dockerfile (Multi-Stage Build)
-
-```dockerfile
-FROM golang:1.23.6-alpine3.21 AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /crypto-ingest ./cmd/ingest
-
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=builder /crypto-ingest /crypto-ingest
-ENTRYPOINT ["/crypto-ingest"]
-```
-
-### Init SQL Update
-
-Modify `docker/postgres/init.sql` to add the `crypto` schema:
-
-```sql
-CREATE SCHEMA IF NOT EXISTS app;
-CREATE SCHEMA IF NOT EXISTS iceberg_catalog;
-CREATE SCHEMA IF NOT EXISTS crypto;
-```
-
-The Go application will execute the table DDL on startup (via `store/migrations.go`), so tables do not need to be in `init.sql`. This keeps the DDL co-located with the Go code that uses it.
-
----
-
-## 11. Scaling Recommendations (Future)
-
-### Adding More Trading Pairs
-
-- Add symbol names to `BINANCE_SYMBOLS` environment variable
-- The worker manager dynamically creates worker goroutines per symbol -- no code changes needed
-- Rate limit budget scales linearly: each additional symbol adds ~23 weight/min (at current intervals)
-- With 3 symbols using 276 weight/min, you can support ~65 symbols before hitting the 5000 weight/min budget
-
-### Adding More Exchanges
-
-- Create a new package per exchange under `internal/client/` (e.g., `internal/client/kraken/`)
-- Define a common `ExchangeClient` interface:
-  ```go
-  type ExchangeClient interface {
-      FetchAggTrades(ctx context.Context, symbol string, fromID int64) ([]Trade, error)
-      FetchOrderBook(ctx context.Context, symbol string, depth int) (*OrderBook, error)
-      FetchTicker24hr(ctx context.Context, symbol string) (*Ticker, error)
-      FetchExchangeInfo(ctx context.Context) ([]SymbolInfo, error)
-  }
-  ```
-- Workers are parameterized by the interface, not by Binance-specific types
-- Add an `exchange` column to PostgreSQL tables to distinguish data sources
-- Run separate rate limiters per exchange
-
-### Vertical Scaling
-
-- Increase `BATCH_SIZE` for higher throughput
-- Reduce poll intervals for higher data freshness
-- The Go runtime efficiently handles hundreds of goroutines -- no need for external orchestration
-
-### Horizontal Scaling (if needed much later)
-
-- Assign different symbols to different instances
-- Use the `crypto.ingest_state` table for distributed coordination (optimistic locking)
-- Consider moving to Kafka/Redpanda (already in the stack) as an intermediate buffer between API polling and PostgreSQL writing
-
----
-
-## Scope
-
-### Files to CREATE
-
-| File | Purpose |
-|------|---------|
-| `crypto-ingest/cmd/ingest/main.go` | Application entrypoint |
-| `crypto-ingest/internal/config/config.go` | Environment-based configuration |
-| `crypto-ingest/internal/client/binance.go` | Binance REST API client |
-| `crypto-ingest/internal/client/ratelimit.go` | Token bucket rate limiter wrapper |
-| `crypto-ingest/internal/model/trade.go` | Aggregate trade model |
-| `crypto-ingest/internal/model/orderbook.go` | Order book model |
-| `crypto-ingest/internal/model/ticker.go` | 24hr ticker model |
-| `crypto-ingest/internal/model/symbol.go` | Symbol metadata model |
-| `crypto-ingest/internal/worker/trade.go` | Trade polling worker |
-| `crypto-ingest/internal/worker/orderbook.go` | Order book polling worker |
-| `crypto-ingest/internal/worker/ticker.go` | Ticker polling worker |
-| `crypto-ingest/internal/worker/manager.go` | Worker lifecycle manager |
-| `crypto-ingest/internal/store/postgres.go` | PostgreSQL connection and batch operations |
-| `crypto-ingest/internal/store/migrations.go` | DDL execution on startup |
-| `crypto-ingest/go.mod` | Go module definition |
-| `crypto-ingest/Dockerfile` | Multi-stage Docker build |
-
-### Files to MODIFY
-
-| File | Change |
-|------|--------|
-| `docker-compose.yml` | Add `crypto-ingest` service block |
-| `docker/postgres/init.sql` | Add `CREATE SCHEMA IF NOT EXISTS crypto;` |
-| `.env` | No change needed -- `POSTGRES_*` vars already exist and are reused |
-
-### Files NOT modified
-
-| File | Reason |
-|------|--------|
-| `CLAUDE.md` | Not requested |
-| `clickhouse/*` | Separate subsystem, not affected |
-| `flink-jobs/*` | Separate subsystem, not affected |
-| `notebooks/*` | Separate subsystem, not affected |
-
----
-
-## Execution Order
-
-1. **Modify `docker/postgres/init.sql`** -- add `crypto` schema. This must happen first because the Go application depends on the schema existing. If the stack is already running, this requires running the SQL manually against the running Postgres container.
-
-2. **Create `crypto-ingest/go.mod`** -- initialize the Go module. Required before any Go code can be written.
-
-3. **Create model structs** (`internal/model/*.go`) -- pure data types with no dependencies. These are used by all other packages.
-
-4. **Create config** (`internal/config/config.go`) -- needed by client, store, and worker packages.
-
-5. **Create rate limiter** (`internal/client/ratelimit.go`) -- needed by the Binance client.
-
-6. **Create Binance client** (`internal/client/binance.go`) -- depends on models and rate limiter.
-
-7. **Create PostgreSQL store** (`internal/store/postgres.go` and `migrations.go`) -- depends on models. Contains all DDL and insert logic.
-
-8. **Create workers** (`internal/worker/*.go`) -- depends on client and store.
-
-9. **Create entrypoint** (`cmd/ingest/main.go`) -- wires everything together.
-
-10. **Create Dockerfile** -- depends on the Go code being compilable.
-
-11. **Modify `docker-compose.yml`** -- add the `crypto-ingest` service.
-
-12. **End-to-end test** -- `docker compose up -d`, verify the crypto-ingest container starts, connects to Postgres, creates tables, and begins ingesting data. Check `crypto.agg_trades`, `crypto.orderbook_snapshots`, `crypto.orderbook_levels`, `crypto.ticker_24hr` for populated rows.
-
----
-
-## Risks
+### Key Implementation Decisions (from 12-agent swarm debate)
+
+| Decision | Rationale | Resolved By |
+|----------|-----------|-------------|
+| **No `shopspring/decimal`** -- pass Binance price strings directly to PG as NUMERIC | Binance returns prices as strings; Go code does not compute with them. PG's NUMERIC parser handles all edge cases. | All 12 agents unanimous |
+| **No FK on `orderbook_levels`** | ~2.1M inserts/day, FK lookup adds overhead. Referential integrity guaranteed by application logic. | All 12 agents unanimous |
+| **Atomic `ingest_state` updates** | Wrap trade batch INSERT + ingest_state UPDATE in same pgx transaction. Prevents wasted re-fetch on crash recovery. | All 12 agents unanimous |
+| **Orderbook depth default: 20** (not 100) | Weight drops from 5 to 2 per request. Volume drops from ~10.4M to ~2.1M rows/day. Configurable via env var. | All 12 agents unanimous |
+| **HTTP 418 = stop workers + 503** (NOT fatal exit) | With `restart: unless-stopped`, fatal exit creates restart loop hammering Binance, extending ban. Stop workers, return 503 on /healthz with ban reason, log ERROR. Operator sees unhealthy container and intervenes. | Charlie-Skeptic won; Alpha+Bravo conceded (restart loop argument) |
+| **pgx pool: MaxConns=12, AcquireTimeout=5s** | 9 workers + health check + migrations + buffer = 12 connections. AcquireTimeout prevents indefinite blocking on pool exhaustion. | Bravo + Charlie, adopted by all |
+| **Batch insert count logging** | Log rows_attempted vs rows_inserted per batch. ON CONFLICT DO NOTHING silently drops rows -- this is the only way to detect it. | Charlie, adopted by all |
+| **Server-side rate monitoring (X-MBX-USED-WEIGHT-1m)** | Read header on every response. Warn at 80% of budget, pause all workers at 95%. Defense in depth: token bucket is proactive (local estimate), header is reactive (server truth). | Alpha, adopted by all |
+| **Exponential backoff with jitter** | Prevents thundering herd when multiple workers retry after shared failure. Formula: `delay * (0.5 + rand.Float64())`. | Bravo, adopted by all |
+| **Log raw response on unmarshal error** | Log first 500 bytes of response body on JSON parse failure. Essential for debugging API format changes. | Charlie, adopted by all |
+| **No premature Fetcher interface in v1** | Concrete Binance client only. Defer interface extraction to multi-exchange milestone. | Alpha-Skeptic, adopted by all |
+| **Validate Binance response structure before insert** | Fail loudly on unexpected schema changes. Never silently insert malformed data. | Alpha-Skeptic, adopted by all |
+| **Fuller ticker_24hr columns** | Zero additional API calls. Includes: last_qty, bid_qty, ask_qty, first_trade_id, last_trade_id. Complete data fidelity. | Bravo, adopted by all |
+| **Health endpoint at `:8085/healthz`** + `--healthcheck` self-probe | Port 8085 verified free. Distroless has no shell/curl/wget, so binary self-probes. | All 12 agents unanimous |
+| **`stop_grace_period: 15s`** | Application flush deadline 10s, Docker gives 15s before SIGKILL. | All 12 agents unanimous |
+| **Startup Binance ping + fail fast** | Geo-blocking is the #1 project risk. Clear error message listing alternative URLs + HTTP_PROXY support. | All 12 agents unanimous |
+| **E2E verification script** | CLAUDE.md mandates E2E testing. Script checks row counts > 0 after 60s. | All 12 agents unanimous |
+
+### Error Handling Strategy (from swarm debate)
+
+| HTTP Status | Action | Rationale |
+|-------------|--------|-----------|
+| **200** | Process response, update ingest_state | Normal operation |
+| **400** | Log error at WARN, skip cycle, no retry | Client error, retrying won't help |
+| **418** | **Stop ALL workers, /healthz returns 503 with ban reason, log ERROR, do NOT exit** | IP ban. Container stays running but unhealthy. Prevents restart loop. Manual intervention required. |
+| **429** | Respect `Retry-After` header, exponential backoff with jitter, max 3 retries | Rate limited. Backoff respects server guidance. |
+| **5xx** | Exponential backoff with jitter (`delay * (0.5 + rand.Float64())`), max 3 retries | Server error, transient. |
+| **Network error** | Exponential backoff with jitter, max 3 retries | Transient connectivity issue. |
+| **JSON unmarshal error** | Log first 500 bytes of raw response at ERROR, skip cycle | API format change detection. |
+
+### Execution Order
+
+0. **Step 0: User verifies Binance connectivity** -- Run `curl -s https://api.binance.com/api/v3/ping` from deployment network. If this fails, resolve connectivity (VPN, proxy, alternative URL) before proceeding. **Do not write any code until this passes.**
+
+1. **Modify `docker/postgres/init.sql`** -- add `CREATE SCHEMA IF NOT EXISTS crypto;`
+   - Why first: establishes schema for fresh volumes; Go app also creates it on startup for existing volumes
+
+2. **Create `crypto-ingest/go.mod`** -- initialize Go module with dependencies
+   - Dependencies: `github.com/jackc/pgx/v5`, `golang.org/x/time`
+   - Why second: all Go files need the module
+
+3. **Create model structs** (`internal/model/`)
+   - Why third: pure data types with zero dependencies, used by all other packages
+
+4. **Create config** (`internal/config/config.go`)
+   - Parse env vars: `DATABASE_URL`, `BINANCE_BASE_URL`, `SYMBOLS`, poll intervals, `ORDERBOOK_DEPTH`, `HEALTH_PORT`, `LOG_LEVEL`, `MAX_RETRIES`, `RETRY_BASE_DELAY`, `PG_MAX_CONNS`, `PG_ACQUIRE_TIMEOUT`
+   - Validate all required vars on startup, fail fast with clear error
+   - Why fourth: needed by client, store, and worker packages
+
+5. **Create rate limiter** (`internal/client/ratelimit.go`)
+   - Wrap `golang.org/x/time/rate.Limiter`, acquire tokens per API weight
+   - Why fifth: needed by Binance client
+
+6. **Create Binance client** (`internal/client/binance.go`)
+   - HTTP client with rate limiter, response parsing, startup ping check
+   - Read `X-MBX-USED-WEIGHT-1m` header on every response: warn at 80% (4800), pause all workers at 95% (5700)
+   - Validate non-empty price/qty strings before returning
+   - Log first 500 bytes of raw response on JSON unmarshal error
+   - Clear startup error message with alternative Binance URLs + HTTP_PROXY note
+   - Why sixth: depends on models + rate limiter
+
+7. **Create PostgreSQL store** (`internal/store/postgres.go` + `migrations.go`)
+   - `migrations.go`: `CREATE SCHEMA IF NOT EXISTS crypto` + all `CREATE TABLE IF NOT EXISTS`
+   - `postgres.go`: pgx pool (MaxConns=12, AcquireTimeout=5s), batch trade inserts (pgx.Batch + ON CONFLICT DO NOTHING), COPY for orderbook levels, simple INSERT for ticker, atomic ingest_state updates
+   - Log rows_attempted vs rows_inserted on every batch insert
+   - Why seventh: depends on models, parallel with step 6
+
+8. **Create workers** (`internal/worker/*.go`)
+   - `trade.go`: poll aggTrades, resume from ingest_state high-water mark (fromId = last_id + 1)
+   - `orderbook.go`: poll depth, insert snapshot + levels in transaction
+   - `ticker.go`: poll 24hr ticker
+   - `manager.go`: start all workers, health endpoint (200 when healthy, 503 on IP ban), graceful shutdown (SIGINT/SIGTERM, 10s flush deadline), 418 handler (stop all workers, set health to 503)
+   - Why eighth: depends on client + store
+
+9. **Create entrypoint** (`cmd/ingest/main.go`)
+   - Wire config -> client -> store -> workers -> manager
+   - Validate config, run migrations, ping Binance, start workers
+   - Include `--healthcheck` flag for distroless self-probe
+   - Why ninth: depends on all internal packages
+
+10. **Create Dockerfile**
+    - Multi-stage: `golang:1.22.12-alpine3.21` build stage -> `gcr.io/distroless/static-debian12:nonroot` runtime
+    - Why tenth: needs compilable Go code
+
+11. **Modify `docker-compose.yml`**
+    - Add `crypto-ingest` service with: environment from `.env`, `depends_on: postgres: condition: service_healthy`, `mem_limit: 256m`, `stop_grace_period: 15s`, healthcheck using `["/crypto-ingest", "--healthcheck"]`, network `data-pipeline`, `restart: unless-stopped`
+    - Why eleventh: needs Dockerfile
+
+12. **Update `.env.example`**
+    - Add crypto-ingest variables: `DATABASE_URL`, `BINANCE_BASE_URL`, `SYMBOLS`, poll intervals, etc.
+    - Why twelfth: documents new configuration
+
+13. **Create `scripts/verify_crypto_e2e.sh`**
+    - Wait 60s, query row counts for all crypto tables, assert all > 0
+    - Why thirteenth: needs running stack
+
+14. **E2E test**
+    - `docker compose up -d`, wait for healthy, run verification script
+    - Why last: validates everything
+
+### Risks
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Binance API changes or deprecates v3 endpoints | Workers fail to parse responses or get 404s | Pin to `/api/v3/` endpoints. Monitor Binance API changelog. The response parsing is tolerant of additional fields (Go's `json.Unmarshal` ignores unknown fields by default). |
-| Binance blocks IP due to accidental rate limit violation | All data ingestion stops | Token bucket limiter set at 5000/min (83% of actual 6000 limit). Read `X-MBX-USED-WEIGHT-1m` header to detect drift. On HTTP 429, back off immediately. |
-| Binance API is unreachable from the local network (firewall, proxy) | No data ingested | Log clear error on startup with the URL being accessed. Make `BINANCE_BASE_URL` configurable for testing with a mock server. |
-| Float precision loss when parsing price/quantity strings | Incorrect prices stored in PostgreSQL | Use `shopspring/decimal` for parsing, store as PostgreSQL `NUMERIC`. Never convert to float64. |
-| Order book data volume overwhelms PostgreSQL storage | Disk fills up | Default 100 levels at 5s interval = ~62M rows/day for order book levels. For local dev this is fine for days of running. Add a configurable retention policy (future enhancement). Log table sizes periodically. |
-| `pgx` COPY protocol does not support `ON CONFLICT` | Cannot use COPY for dedup on agg_trades | Use `pgx.Batch` with INSERT ... ON CONFLICT DO NOTHING for agg_trades. Use COPY for orderbook_levels and ticker_24hr (no conflicts). |
-| High-water mark in `ingest_state` not updated atomically with trade inserts | On crash, some trades may be re-inserted on restart | `ON CONFLICT DO NOTHING` makes this safe. Duplicates are silently dropped. The only cost is re-fetching some trades from Binance (negligible). |
-| Go 1.23 not available in builder image | Build fails | Pin `golang:1.23.6-alpine3.21` (specific patch version). Alternatively use `golang:1.22.x` -- the code uses no 1.23-specific features. |
-| `distroless` base image lacks shell for debugging | Cannot exec into container for troubleshooting | Use `gcr.io/distroless/static-debian12:debug` tag during development (includes busybox shell). Switch to `nonroot` for production. |
-| PostgreSQL connection pool exhaustion under high goroutine count | Workers block waiting for connections | Configure `pgxpool.Config.MaxConns` to at least `num_symbols * 3 + 2` (workers + metadata loader + migrations). Default 10 is sufficient for 3 symbols. |
-| `init.sql` schema change not applied to already-initialized Postgres volume | `crypto` schema does not exist | The Go application's `migrations.go` executes `CREATE SCHEMA IF NOT EXISTS crypto` on startup, independent of `init.sql`. Both paths are covered. |
+| Binance API inaccessible (geo-restrictions for Russia/CIS/US) | No data ingested | Step 0 manual check; `BINANCE_BASE_URL` configurable; alternatives `api1/api2/api3.binance.com`; `HTTP_PROXY`/`HTTPS_PROXY` env var support (native in Go net/http); startup ping fails fast with clear error listing alternatives |
+| Float precision loss on prices/quantities | Incorrect financial data | Pass Binance string prices directly to PG NUMERIC; never use float64; validate non-empty before insert; DoD: grep for zero float64 in model structs |
+| Rate limit exceeded -> HTTP 429 or 418 IP ban | Ingestion stops | Token bucket at 5000/min (83% of 6000); server-side X-MBX-USED-WEIGHT-1m monitoring (pause at 95%); exponential backoff with jitter on 429; 418 stops workers + 503 healthz (no restart loop) |
+| `init.sql` not re-run on existing Postgres volume | `crypto` schema missing | Go app runs `CREATE SCHEMA/TABLE IF NOT EXISTS` on startup independently |
+| Orderbook data volume (~2.1M rows/day at depth=20) | Disk fills over weeks | Configurable depth/interval; retention strategy deferred to v1.1 |
+| Silent data loss from ON CONFLICT DO NOTHING | Undetected missing trades | Batch insert count logging: log rows_attempted vs rows_inserted per batch |
+| pgx pool exhaustion with 9 concurrent workers | Workers block indefinitely | MaxConns=12, AcquireTimeout=5s -- fail fast, retry next cycle |
+| Binance API response format change | Parse errors, no data | Log first 500 bytes of raw response on unmarshal error; validate response structure before insert |
+| Docker restart loop on IP ban | Hammers Binance, extends ban | 418 = stop workers + 503 (NOT fatal exit); container stays running but unhealthy |
+| Crash between batch insert and ingest_state update | Wasted re-fetch work on restart | Atomic: wrap both in same pgx transaction |
+| In-flight HTTP request during shutdown | Partial/corrupt data | Discard in-progress fetches on context cancellation; only flush fully parsed data |
+
+### Configuration (via environment variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | (required) | PostgreSQL connection string |
+| `BINANCE_BASE_URL` | `https://api.binance.com` | Binance REST API base URL |
+| `SYMBOLS` | `BTCUSDT,ETHUSDT,ETHBTC` | Comma-separated trading pairs |
+| `TRADE_POLL_INTERVAL` | `5s` | Trade worker polling interval |
+| `ORDERBOOK_POLL_INTERVAL` | `5s` | Order book worker polling interval |
+| `ORDERBOOK_DEPTH` | `20` | Order book levels per side |
+| `TICKER_POLL_INTERVAL` | `30s` | Ticker worker polling interval |
+| `HEALTH_PORT` | `8085` | Health endpoint listen port |
+| `LOG_LEVEL` | `info` | Structured log level (debug, info, warn, error) |
+| `MAX_RETRIES` | `3` | Max retries per failed API call |
+| `RETRY_BASE_DELAY` | `1s` | Base delay for exponential backoff |
+| `PG_MAX_CONNS` | `12` | pgx pool maximum connections |
+| `PG_ACQUIRE_TIMEOUT` | `5s` | pgx pool connection acquisition timeout |
+
+Go's `net/http` automatically respects `HTTP_PROXY`/`HTTPS_PROXY` environment variables -- no code needed, just set in docker-compose environment for geo-blocking mitigation.
+
+### Go Dependencies
+
+| Module | Version | Purpose |
+|--------|---------|---------|
+| `github.com/jackc/pgx/v5` | v5.7.x | PostgreSQL driver with COPY, batch, pool support |
+| `golang.org/x/time` | v0.9.x | Token bucket rate limiter (`rate.Limiter`) |
+
+Two external dependencies total. `log/slog` is stdlib (Go 1.21+).
+
+### Definition of Done
+
+**Pre-implementation Gate:**
+- [ ] User confirmed `curl -s https://api.binance.com/api/v3/ping` returns `{}` from deployment network
+
+**Infrastructure:**
+- [ ] `docker/postgres/init.sql` includes `CREATE SCHEMA IF NOT EXISTS crypto;`
+- [ ] `docker-compose.yml` includes `crypto-ingest` service with healthcheck, `depends_on`, `stop_grace_period: 15s`, `mem_limit: 256m`, `restart: unless-stopped`
+- [ ] `crypto-ingest/Dockerfile` uses pinned multi-stage build: `golang:1.22.12-alpine3.21` -> `gcr.io/distroless/static-debian12:nonroot`
+- [ ] `docker compose up -d` brings up `crypto-ingest` alongside existing services without errors
+- [ ] `.env.example` updated with crypto-ingest variables
+
+**Go Application:**
+- [ ] `go.mod` has exactly 2 external dependencies: `pgx/v5`, `golang.org/x/time`
+- [ ] `shopspring/decimal` is NOT in `go.mod`
+- [ ] **Zero `float64` in any model struct** -- grep-verifiable: `grep -r "float64" crypto-ingest/internal/model/` returns nothing
+- [ ] **No comments in Go code** -- per CLAUDE.md
+- [ ] Application validates all required env vars on startup and exits with clear error if missing
+- [ ] Application pings Binance API on startup and fails fast with error listing alternative URLs + HTTP_PROXY
+- [ ] Application creates `crypto` schema and all tables on startup via `CREATE IF NOT EXISTS`
+- [ ] pgx pool configured with MaxConns=12, AcquireTimeout=5s
+
+**Data Ingestion:**
+- [ ] Trade workers poll `/api/v3/aggTrades` for BTCUSDT, ETHUSDT, ETHBTC
+- [ ] Order book workers poll `/api/v3/depth?limit=20` for all 3 symbols
+- [ ] Ticker workers poll `/api/v3/ticker/24hr` for all 3 symbols
+- [ ] Exchange metadata loaded from `/api/v3/exchangeInfo` once at startup
+- [ ] All workers respect shared token bucket rate limiter (5000 weight/min)
+- [ ] X-MBX-USED-WEIGHT-1m header read on every response: warn at 80%, pause at 95%
+- [ ] Workers retry failed requests with exponential backoff + jitter (max 3 retries)
+- [ ] Batch insert count logged: rows_attempted vs rows_inserted per batch
+
+**Error Handling:**
+- [ ] HTTP 418: stop ALL workers, /healthz returns 503 with ban reason, do NOT exit process
+- [ ] HTTP 429: respect Retry-After header, exponential backoff with jitter, max 3 retries
+- [ ] HTTP 400: log WARN, skip cycle, no retry
+- [ ] HTTP 5xx: exponential backoff with jitter, max 3 retries
+- [ ] JSON unmarshal error: log first 500 bytes of raw response at ERROR
+- [ ] Binance response structure validated before insert
+
+**Schema:**
+- [ ] `crypto.symbols` populated with 3 symbol records at startup
+- [ ] `crypto.agg_trades` has composite PK `(symbol, agg_trade_id)` and uses `ON CONFLICT DO NOTHING`
+- [ ] `crypto.orderbook_snapshots` has BIGSERIAL PK and `depth_level` column
+- [ ] `crypto.orderbook_levels` has NO foreign key constraint on `snapshot_id`
+- [ ] `crypto.ticker_24hr` includes full column set (last_qty, bid_qty, ask_qty, first_trade_id, last_trade_id)
+- [ ] `crypto.ingest_state` stores high-water marks per (worker_type, symbol)
+- [ ] All prices/quantities stored as NUMERIC (string passthrough from Binance)
+- [ ] All timestamps stored as TIMESTAMPTZ
+
+**Idempotency and Resumability:**
+- [ ] Trade batch inserts and `ingest_state` updates occur in the same pgx transaction
+- [ ] On restart, trade workers resume from `last_id + 1` in `ingest_state`
+- [ ] Duplicate trades are silently skipped via `ON CONFLICT DO NOTHING`
+
+**Operational:**
+- [ ] Health endpoint at `:8085/healthz` returns 200 when healthy, 503 when IP-banned
+- [ ] `--healthcheck` flag makes binary self-probe `/healthz` and exit 0/1 (distroless compatibility)
+- [ ] Docker-compose healthcheck uses `["/crypto-ingest", "--healthcheck"]`
+- [ ] Structured logging via `slog` with configurable log level
+- [ ] Graceful shutdown on SIGINT/SIGTERM: cancel context, flush in-progress batches, 10s deadline
+- [ ] `os.Interrupt + syscall.SIGTERM` used for cross-platform signal handling
+- [ ] On context cancellation, in-flight HTTP responses are discarded (only fully parsed data flushed)
+
+**E2E Verification:**
+- [ ] `scripts/verify_crypto_e2e.sh` exists and checks row counts > 0 for all tables
+- [ ] After running `docker compose up -d` for 60 seconds, all verification checks pass
+- [ ] `crypto.agg_trades` contains rows with valid prices, quantities, and timestamps
+- [ ] `crypto.orderbook_levels` contains bid and ask levels
+- [ ] `crypto.ticker_24hr` contains 24hr stats for all 3 symbols with full column data
+- [ ] `crypto.symbols` contains 3 records (BTCUSDT, ETHUSDT, ETHBTC)
+
+### Validation Checklist
+
+- [ ] `docker compose up -d` -- all services healthy including crypto-ingest
+- [ ] `docker compose logs crypto-ingest` -- no errors, structured JSON logs, batch insert counts visible
+- [ ] `curl localhost:8085/healthz` -- returns 200
+- [ ] `scripts/verify_crypto_e2e.sh` -- all checks pass after 60s
+- [ ] Stop and restart crypto-ingest -- resumes from last ingested trade ID (no duplicates)
+- [ ] `docker compose down && docker compose up -d` -- crypto-ingest creates schema/tables on startup
+- [ ] `grep -r "float64" crypto-ingest/internal/model/` -- returns nothing
+
+### Open Questions
+
+- **Binance geo-availability:** If the user's network blocks Binance, they may need to use a proxy (`HTTP_PROXY`/`HTTPS_PROXY`), VPN, or switch to alternative endpoints (`api1/api2/api3.binance.com`). **Step 0 tests this before any code is written.**
+- **Go Docker image tag:** `golang:1.22.12-alpine3.21` verified as stable by all 3 Verifier agents. Code is compatible with Go 1.22+.
+
+### Deferred to v1.1
+
+- WebSocket streaming (real-time push instead of REST polling)
+- Historical trade backfill (`/api/v3/historicalTrades` -- requires API key)
+- Order book depth > 20 levels (configurable via env var, just change default)
+- Prometheus metrics endpoint
+- Data retention policy (partitioning or batched deletes for orderbook data)
+- `exchange` column on all tables (for multi-exchange support)
+- Kline/candlestick ingestion (`/api/v3/klines`)
+- Multiple exchange support
+- Auto-resume cooldown after IP ban (BAN_COOLDOWN timer)
+
+### Swarm Notes
+
+**Key disagreements resolved:**
+
+1. **HTTP 418 handling (biggest debate):** Alpha and Bravo initially proposed FATAL exit (shutdown binary). Charlie-Skeptic argued this creates a restart loop with `restart: unless-stopped` that hammers Binance and extends the ban. Alpha-Verifier clinched it by confirming no existing service in docker-compose uses restart policies -- adding one with FATAL creates exactly this failure mode. **Resolution: stop workers + 503 healthz (Charlie-Skeptic's approach). 10 of 12 agents explicitly conceded.**
+
+2. **Ticker_24hr column completeness:** Alpha had a leaner column set. Bravo argued for full columns (last_qty, bid_qty, ask_qty, first_trade_id, last_trade_id) since they're free -- zero additional API calls, parsed from the same JSON response. **Resolution: fuller columns (Bravo's approach).**
+
+3. **pgx pool configuration:** Alpha didn't specify pool settings. Bravo proposed MaxConns=12. Charlie added AcquireTimeout=5s to prevent indefinite blocking. **Resolution: MaxConns=12 + AcquireTimeout=5s (Charlie's more complete specification).**
+
+4. **File count (14 vs 16 vs 17):** Structural consolidation question -- whether to merge model files, use embed.FS for schema. **Resolution: left to coder agent's discretion. All approaches are functionally identical.**
+
+5. **Batch insert observability:** Alpha and Bravo didn't specify insert count logging. Charlie proposed logging rows_attempted vs rows_inserted to detect silent data loss from ON CONFLICT DO NOTHING. **Resolution: adopted (Charlie's addition). ~3 lines of code, high observability value.**
+
+6. **429 retry count:** Brief debate between 1 retry (initial Bravo position) and 3 retries (Alpha/Charlie). **Resolution: max 3 retries with exponential backoff + jitter.**
+
+**Confidence level: HIGH**
+
+All 12 agents across 3 independent teams converged on the same architecture, schema, endpoints, dependencies, and Docker approach. The only substantive debate (418 handling) was resolved with a clear technical winner. Every repo fact was verified by 3 independent Verifier agents -- no speculative claims survived.
 
 ---
 
-## Go Dependencies
-
-```
-module crypto-ingest
-
-go 1.23
-
-require (
-    github.com/jackc/pgx/v5         v5.7.2
-    github.com/shopspring/decimal    v1.4.0
-    golang.org/x/time               v0.9.0
-)
-```
-
-- `pgx/v5` -- PostgreSQL driver with native COPY support, connection pooling, and batch operations
-- `shopspring/decimal` -- arbitrary precision decimal for price/quantity parsing
-- `golang.org/x/time` -- token bucket rate limiter (`rate.Limiter`)
-
-No web framework, no ORM, no external JSON library, no external logging library. Standard library covers HTTP client, JSON parsing, and structured logging (`slog`).
-
----
-
-## Definition of Done
-
-### Infrastructure
-- [ ] `docker/postgres/init.sql` contains `CREATE SCHEMA IF NOT EXISTS crypto;`
-- [ ] `docker-compose.yml` contains a `crypto-ingest` service that builds from `crypto-ingest/Dockerfile`
-- [ ] `crypto-ingest/Dockerfile` exists and produces a working container image using multi-stage build with pinned base images (no `latest` tag)
-- [ ] The `crypto-ingest` container starts successfully with `docker compose up -d` and appears healthy in `docker compose ps`
-
-### Go Application
-- [ ] `crypto-ingest/go.mod` defines the module with pinned dependency versions
-- [ ] `crypto-ingest/cmd/ingest/main.go` is the application entrypoint
-- [ ] All configuration is read from environment variables (no hardcoded credentials, no config files)
-- [ ] Application creates the `crypto` schema and all tables on startup if they do not exist (`CREATE TABLE IF NOT EXISTS`)
-- [ ] Application connects to PostgreSQL using the `POSTGRES_DSN` environment variable
-
-### Data Ingestion
-- [ ] Trade worker polls Binance `/api/v3/aggTrades` for each configured symbol at the configured interval
-- [ ] Order book worker polls Binance `/api/v3/depth` for each configured symbol at the configured interval
-- [ ] Ticker worker polls Binance `/api/v3/ticker/24hr` for each configured symbol at the configured interval
-- [ ] Exchange metadata is fetched from `/api/v3/exchangeInfo` and stored in `crypto.symbols` on startup
-- [ ] All prices and quantities are stored as `NUMERIC` (not float) in PostgreSQL
-- [ ] All timestamps are stored as `TIMESTAMPTZ` in UTC
-
-### PostgreSQL Schema
-- [ ] Table `crypto.symbols` exists with correct columns and primary key
-- [ ] Table `crypto.agg_trades` exists with composite primary key `(symbol, agg_trade_id)` and time index
-- [ ] Table `crypto.orderbook_snapshots` exists with primary key and symbol+time index
-- [ ] Table `crypto.orderbook_levels` exists with foreign key to snapshots and composite primary key
-- [ ] Table `crypto.ticker_24hr` exists with primary key and symbol+fetched_at index
-- [ ] Table `crypto.ingest_state` exists with primary key `(worker_type, symbol)`
-
-### Rate Limiting and Error Handling
-- [ ] A shared token bucket rate limiter constrains all API calls to stay within Binance's 6000 weight/min limit
-- [ ] HTTP 429 responses trigger a retry after the `Retry-After` delay
-- [ ] HTTP 418 responses (IP ban) cause immediate shutdown with a clear log message
-- [ ] HTTP 5xx responses trigger exponential backoff (max 3 retries)
-- [ ] PostgreSQL connection loss is handled by `pgxpool` auto-reconnection
-
-### Idempotency
-- [ ] Trade inserts use `ON CONFLICT (symbol, agg_trade_id) DO NOTHING` to prevent duplicates
-- [ ] Trade worker resumes from the last known `agg_trade_id` stored in `crypto.ingest_state` after restart
-- [ ] Restarting the `crypto-ingest` container does not produce duplicate trade rows
-
-### Logging
-- [ ] Structured JSON logging via `log/slog`
-- [ ] Log level is configurable via `LOG_LEVEL` environment variable
-- [ ] Worker start/stop events are logged
-- [ ] Batch insert events include row count and duration
-- [ ] Rate limit warnings include current weight usage
-
-### Graceful Shutdown
-- [ ] `SIGINT` and `SIGTERM` trigger graceful shutdown
-- [ ] All workers flush pending batches before exiting
-- [ ] Shutdown completes within 10 seconds
-
-### End-to-End Verification
-- [ ] After running for 60 seconds, `crypto.agg_trades` contains rows for all 3 symbols (BTCUSDT, ETHUSDT, ETHBTC)
-- [ ] After running for 60 seconds, `crypto.orderbook_snapshots` contains at least 10 snapshots per symbol
-- [ ] After running for 60 seconds, `crypto.orderbook_levels` contains bid and ask rows linked to valid snapshots
-- [ ] After running for 60 seconds, `crypto.ticker_24hr` contains at least 1 row per symbol
-- [ ] After running for 60 seconds, `crypto.symbols` contains metadata for all 3 symbols
-- [ ] Stopping and restarting the container does not produce duplicate trades in `crypto.agg_trades`
-- [ ] No Go source files contain comments (per project rules)
-- [ ] No credentials are hardcoded in any file (all from environment variables / `.env`)
+*Plan produced by 12-agent adversarial swarm forum: 3 independent teams of 4 (architect, skeptic, pragmatist, verifier) each debated internally, presented cross-team, then all 12 agents converged through full-swarm debate. Synthesis applied resolution rules: verifiers win on repo facts, skeptics on risk identification, pragmatists on simplification, architects on structure. Where teams disagreed, the strongest technical argument prevailed regardless of team origin.*

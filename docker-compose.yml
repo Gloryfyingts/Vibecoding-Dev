@@ -249,6 +249,41 @@ services:
     networks:
       - data-pipeline
 
+  crypto-ingest:
+    build:
+      context: ./crypto-ingest
+    container_name: crypto-ingest
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      BINANCE_BASE_URL: ${BINANCE_BASE_URL:-https://api.binance.com}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,ETHBTC}
+      TRADE_POLL_INTERVAL: ${TRADE_POLL_INTERVAL:-5s}
+      ORDERBOOK_POLL_INTERVAL: ${ORDERBOOK_POLL_INTERVAL:-5s}
+      ORDERBOOK_DEPTH: ${ORDERBOOK_DEPTH:-20}
+      TICKER_POLL_INTERVAL: ${TICKER_POLL_INTERVAL:-30s}
+      HEALTH_PORT: ${HEALTH_PORT:-8085}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
+      RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-1s}
+      PG_MAX_CONNS: ${PG_MAX_CONNS:-12}
+      PG_ACQUIRE_TIMEOUT: ${PG_ACQUIRE_TIMEOUT:-5s}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 256m
+    stop_grace_period: 15s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/crypto-ingest", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - data-pipeline
+
   jupyter:
     build:
       context: ./docker/jupyter
